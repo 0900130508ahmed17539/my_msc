@@ -1,0 +1,1348 @@
+"""
+Complete U-Net Flow Matching Implementation for CIFAR-10
+With both Unconditional and Conditional Generation
+Training for 5 epochs, evaluating on 5000 samples with FID, Precision, and Recall
+"""
+
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
+import torch.cuda.amp as amp
+from torch.nn.modules.loss import _Loss
+
+import torchvision
+from torchvision import datasets, transforms
+from torchvision.utils import make_grid, save_image
+import torchvision.models as models
+
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+import os
+import gc
+import time
+import shutil
+import subprocess
+import sys
+from typing import List, Optional, Tuple, Union
+from PIL import Image
+from collections import namedtuple
+from dataclasses import dataclass
+import warnings
+warnings.filterwarnings('ignore')
+
+# Install required packages if needed
+try:
+    from tqdm import tqdm
+except ImportError:
+    print("Installing tqdm...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "tqdm"])
+    from tqdm import tqdm
+
+try:
+    import pytorch_fid
+except ImportError:
+    print("Installing pytorch-fid...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pytorch-fid"])
+
+# ============================================================================
+# DEVICE AND OPTIMIZATION SETUP
+# ============================================================================
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+if torch.cuda.is_available():
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
+    gpu_name = torch.cuda.get_device_name(0)
+    gpu_memory = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    print(f"GPU: {gpu_name}")
+    print(f"GPU Memory: {gpu_memory:.1f} GB")
+    torch.cuda.set_per_process_memory_fraction(0.95)
+
+# Set random seeds
+torch.manual_seed(42)
+np.random.seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+# ============================================================================
+# PRECISION-RECALL METRICS
+# ============================================================================
+
+Manifold = namedtuple("Manifold", ["features", "radii"])
+
+class EfficientPrecisionRecall:
+    """Memory and compute efficient Precision-Recall evaluator"""
+    
+    def __init__(self, k=3, device="cuda"):
+        self.k = k
+        self.device = device
+        
+        # Load VGG16
+        self.vgg16 = models.vgg16(weights=models.VGG16_Weights.DEFAULT)
+        self.vgg16.classifier = self.vgg16.classifier[:4]
+        self.vgg16.eval()
+        
+        for p in self.vgg16.parameters():
+            p.requires_grad = False
+        
+        self.vgg16 = self.vgg16.to(device)
+        
+        if torch.cuda.is_available():
+            self.vgg16 = self.vgg16.half()
+    
+    @torch.no_grad()
+    def extract_features_fast(self, dataloader, max_samples=None):
+        """Extract features with optimizations"""
+        features_list = []
+        samples_processed = 0
+        
+        for batch in tqdm(dataloader, desc="Extracting features"):
+            if max_samples and samples_processed >= max_samples:
+                break
+            
+            # Handle both tuple and tensor inputs
+            if isinstance(batch, (list, tuple)):
+                batch = batch[0]
+            
+            if max_samples:
+                remaining = max_samples - samples_processed
+                batch = batch[:min(len(batch), remaining)]
+            
+            if batch.shape[-1] != 224:
+                batch = F.interpolate(batch, size=(224, 224), 
+                                    mode='bilinear', align_corners=False)
+            
+            batch = batch.to(self.device)
+            
+            if torch.cuda.is_available():
+                batch = batch.half()
+            
+            features = self.vgg16(batch)
+            features_list.append(features.float().cpu().numpy())
+            
+            samples_processed += len(batch)
+        
+        return np.concatenate(features_list, axis=0)
+    
+    def compute_distances_efficient(self, X, Y):
+        """Compute distances using vectorized operations"""
+        X = X.astype(np.float32)
+        Y = Y.astype(np.float32)
+        
+        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
+        Y = Y / (np.linalg.norm(Y, axis=1, keepdims=True) + 1e-8)
+        
+        distances = 1 - np.dot(X, Y.T)
+        
+        return distances
+    
+    def compute_radii_fast(self, features):
+        """Compute k-NN radii efficiently"""
+        n = len(features)
+        radii = np.zeros(n, dtype=np.float32)
+        
+        chunk_size = min(1000, n)
+        
+        for i in range(0, n, chunk_size):
+            end_i = min(i + chunk_size, n)
+            
+            chunk_dists = self.compute_distances_efficient(
+                features[i:end_i], features
+            )
+            
+            for j in range(end_i - i):
+                kth_dists = np.partition(chunk_dists[j], self.k + 1)[:self.k + 1]
+                radii[i + j] = kth_dists[-1]
+        
+        return radii
+    
+    def compute_metrics_fast(self, ref_features, ref_radii, gen_features):
+        """Compute precision and recall efficiently"""
+        n_ref = len(ref_features)
+        n_gen = len(gen_features)
+        
+        if n_ref * n_gen < 1e8:
+            distances = self.compute_distances_efficient(ref_features, gen_features)
+            precision = np.mean(np.any(distances < ref_radii[:, np.newaxis], axis=0))
+            gen_radii = self.compute_radii_fast(gen_features)
+            distances_T = distances.T
+            recall = np.mean(np.any(distances_T < gen_radii[:, np.newaxis], axis=0))
+        else:
+            precision = self._compute_precision_batched(ref_features, ref_radii, gen_features)
+            recall = self._compute_recall_batched(ref_features, gen_features)
+        
+        return precision, recall
+    
+    def _compute_precision_batched(self, ref_features, ref_radii, gen_features):
+        """Compute precision in batches"""
+        n_gen = len(gen_features)
+        batch_size = 100
+        precision_count = 0
+        
+        for i in range(0, n_gen, batch_size):
+            batch = gen_features[i:min(i + batch_size, n_gen)]
+            dists = self.compute_distances_efficient(ref_features, batch)
+            precision_count += np.sum(np.any(dists < ref_radii[:, np.newaxis], axis=0))
+        
+        return precision_count / n_gen
+    
+    def _compute_recall_batched(self, ref_features, gen_features):
+        """Compute recall in batches"""
+        gen_radii = self.compute_radii_fast(gen_features)
+        n_ref = len(ref_features)
+        batch_size = 100
+        recall_count = 0
+        
+        for i in range(0, n_ref, batch_size):
+            batch = ref_features[i:min(i + batch_size, n_ref)]
+            dists = self.compute_distances_efficient(gen_features, batch)
+            recall_count += np.sum(np.any(dists < gen_radii[:, np.newaxis], axis=0))
+        
+        return recall_count / n_ref
+
+# ============================================================================
+# FID COMPUTATION
+# ============================================================================
+
+def compute_fid(real_samples, fake_samples):
+    """Compute FID score between real and fake samples"""
+    
+    # Save samples temporarily for FID computation
+    os.makedirs('fid_temp/real', exist_ok=True)
+    os.makedirs('fid_temp/fake', exist_ok=True)
+    
+    # Save real images
+    for i, img in enumerate(real_samples):
+        img = (img + 1) * 127.5
+        img = img.clamp(0, 255).to(torch.uint8)
+        img_np = img.permute(1, 2, 0).cpu().numpy()
+        img_pil = Image.fromarray(img_np)
+        img_pil.save(f'fid_temp/real/{i:06d}.png')
+    
+    # Save fake images  
+    for i, img in enumerate(fake_samples):
+        img = (img + 1) * 127.5
+        img = img.clamp(0, 255).to(torch.uint8)
+        img_np = img.permute(1, 2, 0).cpu().numpy()
+        img_pil = Image.fromarray(img_np)
+        img_pil.save(f'fid_temp/fake/{i:06d}.png')
+    
+    # Compute FID
+    try:
+        result = subprocess.run(
+            ['python', '-m', 'pytorch_fid', 'fid_temp/real', 'fid_temp/fake',
+             '--device', 'cuda', '--batch-size', '256'],
+            capture_output=True, text=True, timeout=600
+        )
+        
+        if result.returncode == 0:
+            output = result.stdout
+            for line in output.split('\n'):
+                if 'FID:' in line:
+                    fid = float(line.split('FID:')[1].strip().split()[0])
+                    shutil.rmtree('fid_temp')
+                    return fid
+            
+            # Try to parse last line
+            lines = output.strip().split('\n')
+            if lines:
+                try:
+                    fid = float(lines[-1].strip())
+                    shutil.rmtree('fid_temp')
+                    return fid
+                except:
+                    pass
+    except Exception as e:
+        print(f"FID computation error: {e}")
+    
+    shutil.rmtree('fid_temp', ignore_errors=True)
+    return None
+
+# ============================================================================
+# FLOW MATCHING COMPONENTS
+# ============================================================================
+
+class CondOTFlowMatching:
+    """Conditional Optimal Transport Flow Matching"""
+    
+    def __init__(self, sigma_min=0.001):
+        self.sigma_min = sigma_min
+    
+    def sample_xt(self, x0, x1, t):
+        """Interpolate between noise x0 and data x1"""
+        t = t.view(-1, 1, 1, 1)
+        mu_t = (1 - t) * x0 + t * x1
+        return mu_t
+    
+    def compute_ut(self, x0, x1):
+        """Compute the conditional flow velocity"""
+        return x1 - x0
+
+# ============================================================================
+# U-NET ARCHITECTURE
+# ============================================================================
+
+def zero_module(module):
+    """Zero out the parameters of a module."""
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
+
+class GroupNorm32(nn.GroupNorm):
+    def forward(self, x):
+        return super().forward(x.float()).type(x.dtype)
+
+def normalization(channels):
+    """GroupNorm with 32 groups."""
+    return GroupNorm32(32, channels)
+
+def conv_nd(dims, *args, **kwargs):
+    """Create a 2D or 3D conv layer."""
+    if dims == 1:
+        return nn.Conv1d(*args, **kwargs)
+    elif dims == 2:
+        return nn.Conv2d(*args, **kwargs)
+    elif dims == 3:
+        return nn.Conv3d(*args, **kwargs)
+    raise ValueError(f"unsupported dimensions: {dims}")
+
+class SiLU(nn.Module):
+    def forward(self, x):
+        return x * torch.sigmoid(x)
+
+class ResBlock(nn.Module):
+    """Residual block with time embedding."""
+    
+    def __init__(
+        self,
+        channels,
+        emb_channels,
+        dropout,
+        out_channels=None,
+        use_scale_shift_norm=False,
+        dims=2,
+        use_conv=False,
+        up=False,
+        down=False,
+    ):
+        super().__init__()
+        self.channels = channels
+        self.emb_channels = emb_channels
+        self.dropout = dropout
+        self.out_channels = out_channels or channels
+        self.use_scale_shift_norm = use_scale_shift_norm
+
+        self.in_layers = nn.Sequential(
+            normalization(channels),
+            SiLU(),
+            conv_nd(dims, channels, self.out_channels, 3, padding=1),
+        )
+
+        self.updown = up or down
+
+        if up:
+            self.h_upd = nn.Upsample(scale_factor=2, mode="nearest")
+            self.x_upd = nn.Upsample(scale_factor=2, mode="nearest")
+        elif down:
+            self.h_upd = nn.AvgPool2d(2)
+            self.x_upd = nn.AvgPool2d(2)
+        else:
+            self.h_upd = self.x_upd = nn.Identity()
+
+        self.emb_layers = nn.Sequential(
+            SiLU(),
+            nn.Linear(
+                emb_channels,
+                2 * self.out_channels if use_scale_shift_norm else self.out_channels,
+            ),
+        )
+        
+        self.out_layers = nn.Sequential(
+            normalization(self.out_channels),
+            SiLU(),
+            nn.Dropout(p=dropout),
+            zero_module(conv_nd(dims, self.out_channels, self.out_channels, 3, padding=1)),
+        )
+
+        if self.out_channels == channels:
+            self.skip_connection = nn.Identity()
+        else:
+            self.skip_connection = conv_nd(dims, channels, self.out_channels, 1)
+
+    def forward(self, x, emb):
+        if self.updown:
+            h = self.in_layers[:-1](x)
+            h = self.h_upd(h)
+            x = self.x_upd(x)
+            h = self.in_layers[-1](h)
+        else:
+            h = self.in_layers(x)
+            
+        emb_out = self.emb_layers(emb).type(h.dtype)
+        while len(emb_out.shape) < len(h.shape):
+            emb_out = emb_out[..., None]
+            
+        if self.use_scale_shift_norm:
+            out_norm, out_rest = self.out_layers[0], self.out_layers[1:]
+            scale, shift = torch.chunk(emb_out, 2, dim=1)
+            h = out_norm(h) * (1 + scale) + shift
+            h = out_rest(h)
+        else:
+            h = h + emb_out
+            h = self.out_layers(h)
+            
+        return self.skip_connection(x) + h
+
+class AttentionBlock(nn.Module):
+    """Self-attention block."""
+    
+    def __init__(self, channels, num_heads=1, num_head_channels=-1):
+        super().__init__()
+        self.channels = channels
+        if num_head_channels == -1:
+            self.num_heads = num_heads
+        else:
+            assert channels % num_head_channels == 0
+            self.num_heads = channels // num_head_channels
+            
+        self.norm = normalization(channels)
+        self.qkv = conv_nd(1, channels, channels * 3, 1)
+        self.attention = QKVAttention(self.num_heads)
+        self.proj_out = zero_module(conv_nd(1, channels, channels, 1))
+
+    def forward(self, x):
+        b, c, *spatial = x.shape
+        x = x.reshape(b, c, -1)
+        qkv = self.qkv(self.norm(x))
+        h = self.attention(qkv)
+        h = self.proj_out(h)
+        return (x + h).reshape(b, c, *spatial)
+
+class QKVAttention(nn.Module):
+    """QKV attention mechanism."""
+    
+    def __init__(self, n_heads):
+        super().__init__()
+        self.n_heads = n_heads
+
+    def forward(self, qkv):
+        bs, width, length = qkv.shape
+        assert width % (3 * self.n_heads) == 0
+        ch = width // (3 * self.n_heads)
+        q, k, v = qkv.chunk(3, dim=1)
+        scale = 1 / math.sqrt(math.sqrt(ch))
+        weight = torch.einsum(
+            "bct,bcs->bts",
+            (q * scale).view(bs * self.n_heads, ch, length),
+            (k * scale).view(bs * self.n_heads, ch, length),
+        )
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+        a = torch.einsum("bts,bcs->bct", weight, v.reshape(bs * self.n_heads, ch, length))
+        return a.reshape(bs, -1, length)
+
+@dataclass(eq=False)
+class UNetModel(nn.Module):
+    """U-Net model for CIFAR-10 with conditional generation support."""
+    
+    in_channels: int = 3
+    model_channels: int = 128
+    out_channels: int = 3
+    num_res_blocks: int = 4
+    attention_resolutions: Tuple[int] = (2,)
+    dropout: float = 0.3
+    channel_mult: Tuple[int] = (2, 2, 2)
+    conv_resample: bool = False
+    dims: int = 2
+    num_classes: Optional[int] = None  # For conditional generation
+    use_checkpoint: bool = False
+    num_heads: int = 1
+    num_head_channels: int = -1
+    num_heads_upsample: int = -1
+    use_scale_shift_norm: bool = True
+    resblock_updown: bool = False
+    use_new_attention_order: bool = True
+    with_fourier_features: bool = False
+
+    def __post_init__(self):
+        super().__init__()
+
+        if self.num_heads_upsample == -1:
+            self.num_heads_upsample = self.num_heads
+
+        self.time_embed_dim = self.model_channels * 4
+        self.time_embed = nn.Sequential(
+            nn.Linear(self.model_channels, self.time_embed_dim),
+            SiLU(),
+            nn.Linear(self.time_embed_dim, self.time_embed_dim),
+        )
+        
+        # Add class embedding for conditional generation
+        if self.num_classes is not None:
+            self.label_emb = nn.Embedding(self.num_classes, self.time_embed_dim)
+
+        ch = input_ch = int(self.channel_mult[0] * self.model_channels)
+        self.input_blocks = nn.ModuleList(
+            [nn.Sequential(conv_nd(self.dims, self.in_channels, ch, 3, padding=1))]
+        )
+        self._feature_size = ch
+        input_block_chans = [ch]
+        ds = 1
+        
+        for level, mult in enumerate(self.channel_mult):
+            for _ in range(self.num_res_blocks):
+                layers = [
+                    ResBlock(
+                        ch,
+                        self.time_embed_dim,
+                        self.dropout,
+                        out_channels=int(mult * self.model_channels),
+                        dims=self.dims,
+                        use_scale_shift_norm=self.use_scale_shift_norm,
+                    )
+                ]
+                ch = int(mult * self.model_channels)
+                if ds in self.attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            num_heads=self.num_heads,
+                            num_head_channels=self.num_head_channels,
+                        )
+                    )
+                self.input_blocks.append(nn.Sequential(*layers))
+                self._feature_size += ch
+                input_block_chans.append(ch)
+            if level != len(self.channel_mult) - 1:
+                out_ch = ch
+                self.input_blocks.append(
+                    nn.Sequential(
+                        ResBlock(
+                            ch,
+                            self.time_embed_dim,
+                            self.dropout,
+                            out_channels=out_ch,
+                            dims=self.dims,
+                            use_scale_shift_norm=self.use_scale_shift_norm,
+                            down=True,
+                        )
+                        if self.resblock_updown
+                        else nn.AvgPool2d(2)
+                    )
+                )
+                ch = out_ch
+                input_block_chans.append(ch)
+                ds *= 2
+                self._feature_size += ch
+
+        self.middle_block = nn.Sequential(
+            ResBlock(
+                ch,
+                self.time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+            AttentionBlock(
+                ch,
+                num_heads=self.num_heads,
+                num_head_channels=self.num_head_channels,
+            ),
+            ResBlock(
+                ch,
+                self.time_embed_dim,
+                self.dropout,
+                dims=self.dims,
+                use_scale_shift_norm=self.use_scale_shift_norm,
+            ),
+        )
+        self._feature_size += ch
+
+        self.output_blocks = nn.ModuleList([])
+        for level, mult in list(enumerate(self.channel_mult))[::-1]:
+            for i in range(self.num_res_blocks + 1):
+                ich = input_block_chans.pop()
+                layers = [
+                    ResBlock(
+                        ch + ich,
+                        self.time_embed_dim,
+                        self.dropout,
+                        out_channels=int(self.model_channels * mult),
+                        dims=self.dims,
+                        use_scale_shift_norm=self.use_scale_shift_norm,
+                    )
+                ]
+                ch = int(self.model_channels * mult)
+                if ds in self.attention_resolutions:
+                    layers.append(
+                        AttentionBlock(
+                            ch,
+                            num_heads=self.num_heads_upsample,
+                            num_head_channels=self.num_head_channels,
+                        )
+                    )
+                if level and i == self.num_res_blocks:
+                    out_ch = ch
+                    layers.append(
+                        ResBlock(
+                            ch,
+                            self.time_embed_dim,
+                            self.dropout,
+                            out_channels=out_ch,
+                            dims=self.dims,
+                            use_scale_shift_norm=self.use_scale_shift_norm,
+                            up=True,
+                        )
+                        if self.resblock_updown
+                        else nn.Upsample(scale_factor=2, mode="nearest")
+                    )
+                    ds //= 2
+                self.output_blocks.append(nn.Sequential(*layers))
+                self._feature_size += ch
+
+        self.out = nn.Sequential(
+            normalization(ch),
+            SiLU(),
+            zero_module(conv_nd(self.dims, input_ch, self.out_channels, 3, padding=1)),
+        )
+
+    def forward(self, x, t, y=None):
+        """Apply the model to an input batch with optional class conditioning."""
+        # Time embedding
+        emb = self.time_embed(timestep_embedding(t, self.model_channels))
+        
+        # Add class embedding if provided
+        if y is not None and self.num_classes is not None:
+            emb = emb + self.label_emb(y)
+        
+        hs = []
+        h = x
+        for module in self.input_blocks:
+            if isinstance(module, nn.Sequential):
+                for layer in module:
+                    if isinstance(layer, ResBlock):
+                        h = layer(h, emb)
+                    else:
+                        h = layer(h)
+            else:
+                h = module(h)
+            hs.append(h)
+
+        h = self.middle_block[0](h, emb)
+        h = self.middle_block[1](h)
+        h = self.middle_block[2](h, emb)
+
+        for module in self.output_blocks:
+            h = torch.cat([h, hs.pop()], dim=1)
+            for layer in module:
+                if isinstance(layer, ResBlock):
+                    h = layer(h, emb)
+                else:
+                    h = layer(h)
+
+        return self.out(h)
+
+def timestep_embedding(timesteps, dim, max_period=10000):
+    """Create sinusoidal timestep embeddings."""
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    ).to(device=timesteps.device)
+    args = timesteps[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:
+        embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+    return embedding
+
+# ============================================================================
+# EXPONENTIAL MOVING AVERAGE
+# ============================================================================
+
+class EMA(nn.Module):
+    def __init__(self, model, decay=0.9999):
+        super().__init__()
+        self.model = model
+        self.decay = decay
+        self.ema_model = self._copy_model(model)
+        self.register_buffer('num_updates', torch.tensor(0))
+        
+    def _copy_model(self, model):
+        # Create a new instance with the same configuration
+        if hasattr(model, '__dataclass_fields__'):
+            # Handle dataclass models
+            import copy
+            ema_model = copy.deepcopy(model)
+        else:
+            # Handle regular models
+            ema_model = type(model)(**{k: v for k, v in model.__dict__.items() 
+                                       if not k.startswith('_')})
+            ema_model.load_state_dict(model.state_dict())
+        
+        for p in ema_model.parameters():
+            p.requires_grad = False
+        return ema_model
+    
+    @torch.no_grad()
+    def update_ema(self):
+        """Update EMA parameters"""
+        self.num_updates += 1
+        
+        # Use different decay rate at beginning
+        decay = min(self.decay, (1 + self.num_updates) / (10 + self.num_updates))
+        
+        # Update EMA model parameters
+        for ema_param, model_param in zip(self.ema_model.parameters(), self.model.parameters()):
+            ema_param.data.mul_(decay).add_(model_param.data, alpha=1 - decay)
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass through the main model"""
+        return self.model(*args, **kwargs)
+    
+    def state_dict(self):
+        """Return state dict of the main model"""
+        return self.model.state_dict()
+    
+    def load_state_dict(self, state_dict):
+        """Load state dict to the main model"""
+        self.model.load_state_dict(state_dict)
+
+# ============================================================================
+# TRAINING FUNCTIONS
+# ============================================================================
+
+def train_flow_matching(
+    model, 
+    dataloader, 
+    num_epochs=5,
+    lr=2e-4,
+    use_ema=True,
+    ema_decay=0.9999,
+    grad_clip=1.0,
+    warmup_steps=5000,
+    use_mixed_precision=True,
+    conditional=False
+):
+    """Train Flow Matching model with optional conditional generation"""
+    
+    # Wrap model with EMA if requested
+    if use_ema:
+        model = EMA(model, decay=ema_decay)
+    
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.01)
+    
+    # Learning rate schedule with warmup
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        return 1.0
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # Flow matching
+    flow_matching = CondOTFlowMatching()
+    
+    # Mixed precision
+    scaler = amp.GradScaler() if use_mixed_precision else None
+    
+    model.train()
+    losses = []
+    global_step = 0
+    
+    for epoch in range(num_epochs):
+        epoch_losses = []
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{num_epochs}')
+        
+        for batch_idx, (x1, labels) in enumerate(pbar):
+            x1 = x1.to(device)
+            batch_size = x1.shape[0]
+            
+            # Sample noise and time
+            x0 = torch.randn_like(x1)
+            t = torch.rand(batch_size, device=device)
+            
+            # Get interpolated state
+            xt = flow_matching.sample_xt(x0, x1, t)
+            ut = flow_matching.compute_ut(x0, x1)
+            
+            optimizer.zero_grad(set_to_none=True)
+            
+            if conditional:
+                labels = labels.to(device)
+                
+            if use_mixed_precision:
+                with amp.autocast():
+                    if conditional:
+                        pred = model(xt, t, labels)
+                    else:
+                        pred = model(xt, t)
+                    loss = F.mse_loss(pred, ut)
+                
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                if conditional:
+                    pred = model(xt, t, labels)
+                else:
+                    pred = model(xt, t)
+                loss = F.mse_loss(pred, ut)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.step()
+            
+            scheduler.step()
+            
+            # Update EMA
+            if use_ema and global_step % 1 == 0:
+                model.update_ema()
+            
+            epoch_losses.append(loss.item())
+            pbar.set_postfix({'loss': loss.item(), 'lr': scheduler.get_last_lr()[0]})
+            
+            global_step += 1
+        
+        avg_loss = np.mean(epoch_losses)
+        losses.append(avg_loss)
+        print(f'Epoch {epoch+1}: Avg Loss = {avg_loss:.4f}')
+    
+    return model, losses
+
+# ============================================================================
+# SAMPLING FUNCTIONS
+# ============================================================================
+
+@torch.no_grad()
+def sample_flow_ode(model, num_samples, num_steps=50, batch_size=100, use_heun=True, y=None):
+    """Sample using Heun's method with optional class conditioning"""
+    
+    model.eval()
+    if hasattr(model, 'ema_model'):
+        sample_fn = model.ema_model
+    else:
+        sample_fn = model
+    
+    all_samples = []
+    
+    for i in range(0, num_samples, batch_size):
+        curr_batch_size = min(batch_size, num_samples - i)
+        
+        # Start from noise
+        x = torch.randn(curr_batch_size, 3, 32, 32, device=device)
+        
+        # Prepare class labels if conditional
+        if y is not None:
+            if isinstance(y, int):
+                y_batch = torch.full((curr_batch_size,), y, device=device, dtype=torch.long)
+            else:
+                y_batch = y[i:i+curr_batch_size].to(device)
+        else:
+            y_batch = None
+        
+        # Time steps
+        dt = 1.0 / num_steps
+        
+        for step in range(num_steps):
+            t = step * dt
+            t_next = min((step + 1) * dt, 1.0)
+            t_tensor = torch.full((curr_batch_size,), t, device=device)
+            
+            if use_heun and step < num_steps - 1:
+                # Heun's method (2nd order)
+                # First stage
+                if y_batch is not None:
+                    v_t = sample_fn(x, t_tensor, y_batch)
+                else:
+                    v_t = sample_fn(x, t_tensor)
+                x_euler = x + (t_next - t) * v_t
+                
+                # Second stage  
+                t_next_tensor = torch.full((curr_batch_size,), t_next, device=device)
+                if y_batch is not None:
+                    v_next = sample_fn(x_euler, t_next_tensor, y_batch)
+                else:
+                    v_next = sample_fn(x_euler, t_next_tensor)
+                
+                # Heun update
+                x = x + (t_next - t) * 0.5 * (v_t + v_next)
+            else:
+                # Euler step
+                if y_batch is not None:
+                    v_t = sample_fn(x, t_tensor, y_batch)
+                else:
+                    v_t = sample_fn(x, t_tensor)
+                x = x + (t_next - t) * v_t
+        
+        all_samples.append(x.cpu())
+    
+    return torch.cat(all_samples, dim=0)
+
+# ============================================================================
+# EVALUATION FUNCTIONS
+# ============================================================================
+
+def evaluate_model(model, test_loader, num_samples=5000, conditional=False):
+    """Evaluate model with FID, Precision, and Recall metrics"""
+    
+    print(f"\n{'='*70}")
+    print(f"Evaluating {'Conditional' if conditional else 'Unconditional'} Model")
+    print(f"Using {num_samples} samples for evaluation")
+    print(f"{'='*70}")
+    
+    # Generate samples
+    print("Generating samples...")
+    if conditional:
+        # Generate balanced samples across all classes
+        samples_per_class = num_samples // 10
+        all_samples = []
+        for class_id in range(10):
+            class_samples = sample_flow_ode(model, samples_per_class, num_steps=50, y=class_id)
+            all_samples.append(class_samples)
+        fake_samples = torch.cat(all_samples, dim=0)[:num_samples]
+    else:
+        fake_samples = sample_flow_ode(model, num_samples, num_steps=50)
+    
+    # Get real samples
+    real_samples = []
+    for images, _ in test_loader:
+        real_samples.append(images)
+        if len(torch.cat(real_samples)) >= num_samples:
+            break
+    real_samples = torch.cat(real_samples)[:num_samples]
+    
+    # Compute FID
+    print("\nComputing FID Score...")
+    fid = compute_fid(real_samples, fake_samples)
+    if fid:
+        print(f"✓ FID Score: {fid:.2f}")
+    else:
+        print("✗ FID computation failed")
+    
+    # Compute Precision-Recall
+    print("\nComputing Precision-Recall...")
+    pr_eval = EfficientPrecisionRecall(k=3, device=device)
+    
+    # Create simple dataloaders
+    real_loader = [(real_samples[i:i+64],) for i in range(0, len(real_samples), 64)]
+    fake_loader = [(fake_samples[i:i+64],) for i in range(0, len(fake_samples), 64)]
+    
+    real_features = pr_eval.extract_features_fast(real_loader, num_samples)
+    real_radii = pr_eval.compute_radii_fast(real_features)
+    fake_features = pr_eval.extract_features_fast(fake_loader, num_samples)
+    
+    precision, recall = pr_eval.compute_metrics_fast(real_features, real_radii, fake_features)
+    
+    print(f"✓ Precision: {precision:.4f}")
+    print(f"✓ Recall: {recall:.4f}")
+    
+    # Print summary box
+    print(f"\n{'='*35}")
+    print(f"  EVALUATION SUMMARY")
+    print(f"  {'Conditional' if conditional else 'Unconditional'} Model")
+    print(f"{'='*35}")
+    if fid:
+        print(f"  FID:       {fid:.2f}")
+    print(f"  Precision: {precision:.4f}")
+    print(f"  Recall:    {recall:.4f}")
+    print(f"{'='*35}")
+    
+    return {'fid': fid, 'precision': precision, 'recall': recall}
+
+# ============================================================================
+# VISUALIZATION FUNCTIONS
+# ============================================================================
+
+def visualize_samples(model, num_samples=64, conditional=False, save_name="samples"):
+    """Visualize generated samples"""
+    
+    print(f"Generating {'conditional' if conditional else 'unconditional'} samples for visualization...")
+    
+    if conditional:
+        # Generate samples for each class
+        samples_per_class = num_samples // 10
+        all_samples = []
+        for class_id in range(10):
+            class_samples = sample_flow_ode(model, samples_per_class, num_steps=50, y=class_id)
+            all_samples.append(class_samples)
+        samples = torch.cat(all_samples, dim=0)[:num_samples]
+    else:
+        samples = sample_flow_ode(model, num_samples, num_steps=50)
+    
+    # Create grid
+    grid = make_grid(samples, nrow=8, normalize=True, value_range=(-1, 1))
+    
+    # Save grid
+    os.makedirs('samples', exist_ok=True)
+    save_image(grid, f'samples/{save_name}.png')
+    
+    return samples
+
+def plot_conditional_samples(model, save_name="conditional_grid"):
+    """Plot conditional samples for all CIFAR-10 classes"""
+    
+    print("Generating conditional samples for all classes...")
+    
+    class_names = ['airplane', 'automobile', 'bird', 'cat', 'deer',
+                   'dog', 'frog', 'horse', 'ship', 'truck']
+    
+    fig, axes = plt.subplots(2, 5, figsize=(15, 6))
+    axes = axes.flatten()
+    
+    for class_id in range(10):
+        # Generate 9 samples for this class
+        samples = sample_flow_ode(model, 9, num_steps=50, y=class_id)
+        
+        # Create grid for this class
+        grid = make_grid(samples, nrow=3, normalize=True, value_range=(-1, 1))
+        
+        # Convert to numpy and plot
+        grid_np = grid.permute(1, 2, 0).cpu().numpy()
+        axes[class_id].imshow(grid_np)
+        axes[class_id].set_title(f'{class_names[class_id]} (class {class_id})')
+        axes[class_id].axis('off')
+    
+    plt.suptitle('Conditional Generation - All CIFAR-10 Classes', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig(f'samples/{save_name}.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print(f"Conditional samples saved to 'samples/{save_name}.png'")
+
+def compare_models(uncond_model, cond_model, num_samples=32):
+    """Compare unconditional and conditional models side by side"""
+    
+    print("Comparing unconditional and conditional models...")
+    
+    # Generate unconditional samples
+    uncond_samples = sample_flow_ode(uncond_model, num_samples, num_steps=50)
+    
+    # Generate conditional samples (balanced across classes)
+    samples_per_class = num_samples // 10
+    cond_samples_list = []
+    for class_id in range(10):
+        n_samples = samples_per_class + (1 if class_id < num_samples % 10 else 0)
+        if n_samples > 0:
+            class_samples = sample_flow_ode(cond_model, n_samples, num_steps=50, y=class_id)
+            cond_samples_list.append(class_samples)
+    cond_samples = torch.cat(cond_samples_list, dim=0)[:num_samples]
+    
+    # Create grids
+    uncond_grid = make_grid(uncond_samples, nrow=8, normalize=True, value_range=(-1, 1))
+    cond_grid = make_grid(cond_samples, nrow=8, normalize=True, value_range=(-1, 1))
+    
+    # Plot comparison
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    axes[0].imshow(uncond_grid.permute(1, 2, 0).cpu().numpy())
+    axes[0].set_title('Unconditional Generation', fontsize=14, fontweight='bold')
+    axes[0].axis('off')
+    
+    axes[1].imshow(cond_grid.permute(1, 2, 0).cpu().numpy())
+    axes[1].set_title('Conditional Generation (Mixed Classes)', fontsize=14, fontweight='bold')
+    axes[1].axis('off')
+    
+    plt.suptitle('Comparison: Unconditional vs Conditional Flow Matching', fontsize=16, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('samples/model_comparison.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    print("Comparison saved to 'samples/model_comparison.png'")
+
+# ============================================================================
+# MAIN TRAINING SCRIPT
+# ============================================================================
+
+def main():
+    print("="*80)
+    print("CIFAR-10 Flow Matching: Unconditional and Conditional Generation")
+    print("Training for 5 epochs, evaluating on 5000 samples")
+    print("="*80)
+    
+    # Load CIFAR-10
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
+    ])
+    
+    print("\nLoading CIFAR-10 dataset...")
+    train_dataset = datasets.CIFAR10(
+        root='./data', 
+        train=True, 
+        download=True, 
+        transform=transform
+    )
+    
+    test_dataset = datasets.CIFAR10(
+        root='./data',
+        train=False,
+        download=True,
+        transform=transform
+    )
+    
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=64,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True
+    )
+    
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    print(f"Dataset loaded: {len(train_dataset)} training samples")
+    
+    # ============================================================================
+    # TRAIN UNCONDITIONAL MODEL
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("TRAINING UNCONDITIONAL MODEL")
+    print("="*80)
+    
+    # Initialize unconditional model
+    uncond_model = UNetModel(
+        in_channels=3,
+        model_channels=128,
+        out_channels=3,
+        num_res_blocks=4,
+        attention_resolutions=(2,),
+        dropout=0.3,
+        channel_mult=(2, 2, 2),
+        conv_resample=False,
+        dims=2,
+        num_classes=None,  # No class conditioning
+        use_checkpoint=False,
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=True,
+        resblock_updown=False,
+        use_new_attention_order=True,
+        with_fourier_features=False
+    ).to(device)
+    
+    # Count parameters
+    num_params_uncond = sum(p.numel() for p in uncond_model.parameters() if p.requires_grad)
+    print(f"Unconditional model parameters: {num_params_uncond:,}")
+    
+    # Train unconditional model
+    uncond_model, uncond_losses = train_flow_matching(
+        uncond_model,
+        train_loader,
+        num_epochs=2,
+        lr=2e-4,
+        use_ema=True,
+        ema_decay=0.9999,
+        grad_clip=1.0,
+        warmup_steps=5000,
+        use_mixed_precision=True,
+        conditional=False
+    )
+    
+    # ============================================================================
+    # TRAIN CONDITIONAL MODEL
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("TRAINING CONDITIONAL MODEL")
+    print("="*80)
+    
+    # Initialize conditional model
+    cond_model = UNetModel(
+        in_channels=3,
+        model_channels=128,
+        out_channels=3,
+        num_res_blocks=4,
+        attention_resolutions=(2,),
+        dropout=0.3,
+        channel_mult=(2, 2, 2),
+        conv_resample=False,
+        dims=2,
+        num_classes=10,  # 10 classes for CIFAR-10
+        use_checkpoint=False,
+        num_heads=1,
+        num_head_channels=-1,
+        num_heads_upsample=-1,
+        use_scale_shift_norm=True,
+        resblock_updown=False,
+        use_new_attention_order=True,
+        with_fourier_features=False
+    ).to(device)
+    
+    # Count parameters
+    num_params_cond = sum(p.numel() for p in cond_model.parameters() if p.requires_grad)
+    print(f"Conditional model parameters: {num_params_cond:,}")
+    
+    # Train conditional model
+    cond_model, cond_losses = train_flow_matching(
+        cond_model,
+        train_loader,
+        num_epochs=2,
+        lr=2e-4,
+        use_ema=True,
+        ema_decay=0.9999,
+        grad_clip=1.0,
+        warmup_steps=5000,
+        use_mixed_precision=True,
+        conditional=True
+    )
+    
+    # ============================================================================
+    # GENERATE AND VISUALIZE SAMPLES
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("GENERATING SAMPLES")
+    print("="*80)
+    
+    # Generate unconditional samples
+    print("\nGenerating unconditional samples...")
+    uncond_samples = visualize_samples(uncond_model, num_samples=64, conditional=False, 
+                                      save_name="unconditional_samples")
+    
+    # Generate conditional samples
+    print("\nGenerating conditional samples...")
+    cond_samples = visualize_samples(cond_model, num_samples=64, conditional=True, 
+                                    save_name="conditional_samples")
+    
+    # Plot conditional samples for all classes
+    plot_conditional_samples(cond_model, save_name="conditional_all_classes")
+    
+    # Compare models side by side
+    compare_models(uncond_model, cond_model, num_samples=32)
+    
+    # ============================================================================
+    # EVALUATE MODELS
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("EVALUATION")
+    print("="*80)
+    
+    # Evaluate unconditional model with 5000 samples
+    print("\nEvaluating unconditional model...")
+    uncond_metrics = evaluate_model(uncond_model, test_loader, num_samples=5000, conditional=False)
+    
+    # Evaluate conditional model with 5000 samples
+    print("\nEvaluating conditional model...")
+    cond_metrics = evaluate_model(cond_model, test_loader, num_samples=5000, conditional=True)
+    
+    # ============================================================================
+    # PLOT TRAINING LOSSES
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("PLOTTING RESULTS")
+    print("="*80)
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Plot unconditional loss
+    axes[0].plot(uncond_losses, label='Unconditional', linewidth=2)
+    axes[0].set_title('Unconditional Model Training Loss', fontsize=12, fontweight='bold')
+    axes[0].set_xlabel('Epoch')
+    axes[0].set_ylabel('MSE Loss')
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend()
+    
+    # Plot conditional loss
+    axes[1].plot(cond_losses, label='Conditional', linewidth=2, color='orange')
+    axes[1].set_title('Conditional Model Training Loss', fontsize=12, fontweight='bold')
+    axes[1].set_xlabel('Epoch')
+    axes[1].set_ylabel('MSE Loss')
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend()
+    
+    plt.suptitle('Flow Matching Training Progress', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    plt.savefig('samples/training_losses.png', dpi=150, bbox_inches='tight')
+    plt.show()
+    
+    # ============================================================================
+    # SAVE RESULTS
+    # ============================================================================
+    
+    print("\n" + "="*80)
+    print("FINAL RESULTS SUMMARY")
+    print("="*80)
+    
+    with open('results.txt', 'w') as f:
+        f.write("CIFAR-10 Flow Matching Results\n")
+        f.write("="*50 + "\n\n")
+        
+        f.write("UNCONDITIONAL MODEL:\n")
+        f.write(f"  - Parameters: {num_params_uncond:,}\n")
+        f.write(f"  - Final Loss: {uncond_losses[-1]:.4f}\n")
+        if uncond_metrics['fid']:
+            f.write(f"  - FID: {uncond_metrics['fid']:.2f}\n")
+        f.write(f"  - Precision: {uncond_metrics['precision']:.4f}\n")
+        f.write(f"  - Recall: {uncond_metrics['recall']:.4f}\n\n")
+        
+        f.write("CONDITIONAL MODEL:\n")
+        f.write(f"  - Parameters: {num_params_cond:,}\n")
+        f.write(f"  - Final Loss: {cond_losses[-1]:.4f}\n")
+        if cond_metrics['fid']:
+            f.write(f"  - FID: {cond_metrics['fid']:.2f}\n")
+        f.write(f"  - Precision: {cond_metrics['precision']:.4f}\n")
+        f.write(f"  - Recall: {cond_metrics['recall']:.4f}\n\n")
+        
+        f.write(f"Training: 5 epochs total\n")
+        f.write(f"Evaluation: 5000 samples\n")
+    
+    # Print summary
+    print("\nUNCONDITIONAL MODEL:")
+    print(f"  - Parameters: {num_params_uncond:,}")
+    print(f"  - Final Loss: {uncond_losses[-1]:.4f}")
+    if uncond_metrics['fid']:
+        print(f"  - FID: {uncond_metrics['fid']:.2f}")
+    print(f"  - Precision: {uncond_metrics['precision']:.4f}")
+    print(f"  - Recall: {uncond_metrics['recall']:.4f}")
+    
+    print("\nCONDITIONAL MODEL:")
+    print(f"  - Parameters: {num_params_cond:,}")
+    print(f"  - Final Loss: {cond_losses[-1]:.4f}")
+    if cond_metrics['fid']:
+        print(f"  - FID: {cond_metrics['fid']:.2f}")
+    print(f"  - Precision: {cond_metrics['precision']:.4f}")
+    print(f"  - Recall: {cond_metrics['recall']:.4f}")
+    
+    print("\n" + "="*80)
+    print("TRAINING COMPLETE!")
+    print("="*80)
+    print(f"Results saved to 'results.txt'")
+    print(f"Samples saved to 'samples/' directory")
+    print(f"Models saved and ready for use")
+    
+    # Save models
+    os.makedirs('models', exist_ok=True)
+    if hasattr(uncond_model, 'ema_model'):
+        torch.save(uncond_model.ema_model.state_dict(), 'models/unconditional_model.pt')
+    else:
+        torch.save(uncond_model.state_dict(), 'models/unconditional_model.pt')
+        
+    if hasattr(cond_model, 'ema_model'):
+        torch.save(cond_model.ema_model.state_dict(), 'models/conditional_model.pt')
+    else:
+        torch.save(cond_model.state_dict(), 'models/conditional_model.pt')
+    
+    return uncond_model, cond_model, uncond_metrics, cond_metrics
+
+if __name__ == "__main__":
+    uncond_model, cond_model, uncond_metrics, cond_metrics = main()
